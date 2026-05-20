@@ -1,0 +1,14 @@
+# Temp files from local testing
+/tmp/
+*.zip
+*.mp4
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets — never commit tokens
+secrets.txt
+*.env
+.env
