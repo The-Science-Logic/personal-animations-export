@@ -1,0 +1,146 @@
+name: Export MP4
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Unique export job ID from app'
+        required: true
+        type: string
+      fps:
+        description: 'Frames per second'
+        required: true
+        default: '30'
+        type: string
+      quality:
+        description: 'Export quality: low, medium, high'
+        required: true
+        default: 'high'
+        type: string
+      total_frames:
+        description: 'Total number of frames in animation'
+        required: true
+        type: string
+      upload_url:
+        description: 'Pre-signed or direct URL where frames ZIP is hosted'
+        required: true
+        type: string
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout export repo
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version
+
+      - name: Create working directories
+        run: |
+          mkdir -p /tmp/pa_export/frames
+          mkdir -p /tmp/pa_export/output
+
+      - name: Download frames ZIP from app
+        run: |
+          echo "Downloading frames for job: ${{ inputs.job_id }}"
+          curl -L \
+            -H "Authorization: Bearer ${{ secrets.APP_UPLOAD_TOKEN }}" \
+            -o /tmp/pa_export/frames.zip \
+            "${{ inputs.upload_url }}"
+          echo "Download complete. Checking file..."
+          ls -lh /tmp/pa_export/frames.zip
+
+      - name: Validate ZIP is not empty or corrupt
+        run: |
+          FILE_SIZE=$(stat -c%s "/tmp/pa_export/frames.zip")
+          if [ "$FILE_SIZE" -lt 1024 ]; then
+            echo "ERROR: frames.zip is too small ($FILE_SIZE bytes). Likely corrupt or failed download."
+            exit 1
+          fi
+          unzip -t /tmp/pa_export/frames.zip > /dev/null 2>&1
+          if [ $? -ne 0 ]; then
+            echo "ERROR: frames.zip failed integrity check."
+            exit 1
+          fi
+          echo "ZIP integrity OK. Size: $FILE_SIZE bytes."
+
+      - name: Extract frames
+        run: |
+          unzip -q /tmp/pa_export/frames.zip -d /tmp/pa_export/frames
+          FRAME_COUNT=$(ls /tmp/pa_export/frames/*.png 2>/dev/null | wc -l)
+          echo "Extracted $FRAME_COUNT PNG frames."
+          if [ "$FRAME_COUNT" -lt 1 ]; then
+            echo "ERROR: No PNG frames found after extraction."
+            exit 1
+          fi
+
+      - name: Verify frame sequence is contiguous
+        run: |
+          bash scripts/verify_frames.sh /tmp/pa_export/frames ${{ inputs.total_frames }}
+
+      - name: Render MP4 with FFmpeg
+        run: |
+          bash scripts/render_mp4.sh \
+            /tmp/pa_export/frames \
+            /tmp/pa_export/output/animation.mp4 \
+            ${{ inputs.fps }} \
+            ${{ inputs.quality }}
+
+      - name: Verify output MP4
+        run: |
+          if [ ! -f /tmp/pa_export/output/animation.mp4 ]; then
+            echo "ERROR: animation.mp4 was not created."
+            exit 1
+          fi
+          OUTPUT_SIZE=$(stat -c%s "/tmp/pa_export/output/animation.mp4")
+          if [ "$OUTPUT_SIZE" -lt 10240 ]; then
+            echo "ERROR: animation.mp4 is too small ($OUTPUT_SIZE bytes). Render likely failed."
+            exit 1
+          fi
+          echo "MP4 OK. Size: $OUTPUT_SIZE bytes."
+          ffprobe -v quiet -print_format json -show_format -show_streams \
+            /tmp/pa_export/output/animation.mp4 | \
+            python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          fmt = data.get('format', {})
+          print(f\"Duration: {float(fmt.get('duration', 0)):.2f}s\")
+          print(f\"Bitrate:  {int(fmt.get('bit_rate', 0)) // 1000} kbps\")
+          print(f\"Size:     {int(fmt.get('size', 0)) // (1024*1024)} MB\")
+          "
+
+      - name: Upload MP4 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: export-${{ inputs.job_id }}
+          path: /tmp/pa_export/output/animation.mp4
+          retention-days: 1
+
+      - name: Report success to app
+        if: success()
+        run: |
+          bash scripts/notify_app.sh \
+            "${{ inputs.job_id }}" \
+            "success" \
+            "${{ secrets.APP_CALLBACK_TOKEN }}"
+
+      - name: Report failure to app
+        if: failure()
+        run: |
+          bash scripts/notify_app.sh \
+            "${{ inputs.job_id }}" \
+            "failed" \
+            "${{ secrets.APP_CALLBACK_TOKEN }}"
+
+      - name: Cleanup working files
+        if: always()
+        run: |
+          bash scripts/cleanup_artifacts.sh \
+            "${{ inputs.job_id }}" \
+            /tmp/pa_export
